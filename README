@@ -1,0 +1,10 @@
+usage: jp [-chlr] PTR
+parse json input from stdin, and extract values specified by PTR
+
+  PTR  json pointer (/foo/bar/0) https://www.rfc-editor.org/rfc/rfc6901
+  -c   compact output
+  -h   print usage string
+  -l   listy formatted output
+  -r   raw strings
+
+json-ptr 0.1.0 by shua <itis@isthisa.email>
