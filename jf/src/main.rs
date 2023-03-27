@@ -187,349 +187,6 @@ impl Env {
 
 type Context = (Env, Value);
 
-trait Filter {
-    type Out: Iterator<Item = Context>;
-
-    fn feval(&self, ctx: Context) -> Self::Out;
-
-    fn fbox(mut self) -> DynFilter
-    where
-        Self: Sized + 'static,
-    {
-        DynFilter(Rc::new(move |ctx| Box::new(self.feval(ctx))))
-    }
-}
-impl<Out> Filter for fn(Context) -> Out
-where
-    Out: Iterator<Item = Context>,
-{
-    type Out = Out;
-    fn feval(&self, ctx: Context) -> Out {
-        self(ctx)
-    }
-}
-
-#[derive(Clone)]
-struct CloseFilter<F>(F);
-impl<F, It> Filter for CloseFilter<F>
-where
-    F: Fn(Context) -> It,
-    It: Iterator<Item = Context>,
-{
-    type Out = It;
-    fn feval(&self, ctx: Context) -> It {
-        self.0(ctx)
-    }
-}
-
-#[derive(Clone)]
-struct DynFilter(Rc<dyn Fn(Context) -> Box<dyn Iterator<Item = Context>>>);
-impl Filter for DynFilter {
-    type Out = Box<dyn Iterator<Item = Context>>;
-
-    fn feval(&self, ctx: Context) -> Self::Out {
-        self.0(ctx)
-    }
-}
-
-fn literal(val: impl Into<Value>) -> impl Filter {
-    let val = val.into();
-    CloseFilter(move |(env, _)| once((env, val.clone())))
-}
-
-// .foo  .[0] .["foo"] .[f]
-fn path(mut f: impl Filter) -> impl Filter {
-    CloseFilter(move |(env, val): Context| {
-        f.feval((env.clone(), val.clone()))
-            .map(move |(_, key)| (env.clone(), val[&key].clone()))
-    })
-}
-
-// .[]
-struct Spread(Env, Vec<Value>);
-impl Iterator for Spread {
-    type Item = Context;
-    fn next(&mut self) -> Option<Context> {
-        self.1.pop().map(|v| (self.0.clone(), v))
-    }
-}
-fn spread((env, val): Context) -> Spread {
-    match val {
-        Value::Array(es) => Spread(env, es.into_iter().rev().collect()),
-        Value::Object(fs) => Spread(env, fs.into_iter().map(|(_, v)| v).rev().collect()),
-        v => panic!("unable to apply .[] to {}", v.kind()),
-    }
-}
-const SPREAD: fn(Context) -> Spread = spread;
-const DOT: fn(Context) -> Once<Context> = once;
-
-#[derive(Clone)]
-struct MkArray(Vec<DynFilter>);
-impl MkArray {
-    fn push(&mut self, mut f: impl Filter + 'static) {
-        let f = DynFilter(Rc::new(move |ctx| Box::new(f.feval(ctx))));
-        self.0.push(f);
-    }
-    fn v(mut self, f: impl Filter + 'static) -> Self {
-        self.push(f);
-        self
-    }
-
-    fn end(mut self) -> impl Filter {
-        CloseFilter(move |(env, val): Context| {
-            let mut vs = vec![];
-            let mut fs = self.0.clone();
-            for fval in fs.iter_mut().rev() {
-                vs.extend(fval.0((env.clone(), val.clone())).map(|(_, v)| v));
-            }
-            std::iter::once((env.clone(), Value::Array(vs)))
-        })
-    }
-}
-// [ f, g, ... ]
-fn mkarray() -> MkArray {
-    MkArray(vec![])
-}
-
-#[derive(Clone)]
-struct MkObject(Vec<(String, DynFilter)>);
-struct MkObjectIterField {
-    key: String,
-    fval: DynFilter,
-    cur: usize,
-    next: Peekable<Box<dyn Iterator<Item = Context>>>,
-}
-impl MkObjectIterField {
-    fn new(key: String, fval: DynFilter, ctx: Context) -> Self {
-        let next = fval.0(ctx).peekable();
-        MkObjectIterField {
-            key,
-            fval,
-            cur: 0,
-            next,
-        }
-    }
-}
-enum MkObjectIter {
-    Done,
-    First {
-        input: Context,
-        fs: Vec<(String, DynFilter)>,
-    },
-    Rest {
-        input: Context,
-        fs: Vec<MkObjectIterField>,
-    },
-}
-impl Clone for MkObjectIter {
-    fn clone(&self) -> Self {
-        match self {
-            MkObjectIter::Done => MkObjectIter::Done,
-            MkObjectIter::First { input, fs } => MkObjectIter::First {
-                input: input.clone(),
-                fs: fs.clone(),
-            },
-            MkObjectIter::Rest { input, fs } => MkObjectIter::Rest {
-                input: input.clone(),
-                fs: fs
-                    .iter()
-                    .map(|fld| MkObjectIterField {
-                        key: fld.key.clone(),
-                        fval: fld.fval.clone(),
-                        cur: fld.cur,
-                        next: (Box::new(fld.fval.0(input.clone()).skip(fld.cur))
-                            as Box<dyn Iterator<Item = Context>>)
-                            .peekable(),
-                    })
-                    .collect(),
-            },
-        }
-    }
-}
-impl Iterator for MkObjectIter {
-    type Item = Context;
-    fn next(&mut self) -> Option<Context> {
-        match self {
-            MkObjectIter::Done => return None,
-            &mut MkObjectIter::First { .. } => {
-                let (input, fs) = if let MkObjectIter::First { input, fs } =
-                    std::mem::replace(self, MkObjectIter::Done)
-                {
-                    (input, fs)
-                } else {
-                    unreachable!("guarded by upper match")
-                };
-                let (ret, mkobjit) = MkObjectIter::first(input, fs)?;
-                *self = mkobjit;
-                Some(ret)
-            }
-            &mut MkObjectIter::Rest {
-                ref mut input,
-                ref mut fs,
-            } => {
-                let mut should_advance = true;
-                let mut flds = vec![];
-                for fld in fs.iter_mut() {
-                    if !should_advance {
-                        let (_, v) = (fld.next.peek())
-                            .expect("already checked peekable in previous iteration");
-                        flds.push((fld.key.clone(), v.clone()));
-                        continue;
-                    }
-                    fld.next.next();
-                    if fld.next.peek().is_some() {
-                        should_advance = false;
-                    } else {
-                        // restart
-                        fld.next = fld.fval.feval(input.clone()).peekable();
-                    }
-                    let (_, v) =
-                        (fld.next.peek()).expect("already checked that the fields were non-empty");
-                    flds.push((fld.key.clone(), v.clone()));
-                }
-                if should_advance {
-                    // all of the field filters have been iterated through
-                    *self = MkObjectIter::Done;
-                    return None;
-                }
-                Some((input.0.clone(), Value::Object(flds)))
-            }
-        }
-    }
-}
-impl MkObjectIter {
-    fn first(ctx: Context, fs: Vec<(String, DynFilter)>) -> Option<(Context, MkObjectIter)> {
-        // short-circuit case with no fields, emit single {}
-        if fs.is_empty() {
-            return Some(((ctx.0, Value::Object(vec![])), MkObjectIter::Done));
-        }
-
-        let mut fs: Vec<_> = fs
-            .into_iter()
-            .map(|(key, fval)| MkObjectIterField::new(key, fval, ctx.clone()))
-            .collect();
-        if fs.iter_mut().any(|fld| fld.next.peek().is_none()) {
-            return None;
-        }
-        let ret: Vec<_> = fs
-            .iter_mut()
-            .map(|fld| {
-                (
-                    fld.key.clone(),
-                    fld.next.peek().map(|(_, v)| v).cloned().unwrap(),
-                )
-            })
-            .collect();
-        Some((
-            (ctx.0.clone(), Value::Object(ret)),
-            MkObjectIter::Rest { input: ctx, fs },
-        ))
-    }
-}
-impl MkObject {
-    fn push(&mut self, key: String, mut f: impl Filter + 'static) {
-        let f = DynFilter(Rc::new(move |ctx| Box::new(f.feval(ctx))));
-        self.0.push((key, f));
-    }
-    fn kv(mut self, key: impl Into<String>, mut f: impl Filter + 'static) -> Self {
-        self.push(key.into(), f);
-        self
-    }
-    fn end(mut self) -> impl Filter {
-        CloseFilter(move |(env, val)| MkObjectIter::First {
-            input: (env, val),
-            fs: self.0.clone(),
-        })
-    }
-}
-fn mkobject() -> MkObject {
-    MkObject(vec![])
-}
-
-fn length((env, val): Context) -> impl Iterator<Item = Context> {
-    match val {
-        Value::String(s) => once((env, Value::Number(i64::try_from(s.len()).unwrap()))),
-        Value::Array(es) => once((env, Value::Number(i64::try_from(es.len()).unwrap()))),
-        _ => panic!("unable to take length of {}", val.kind()),
-    }
-}
-
-fn keys((env, val): Context) -> impl Iterator<Item = Context> {
-    match val {
-        Value::Object(fs) => once((
-            env,
-            Value::Array(fs.into_iter().map(|(k, _)| Value::String(k)).collect()),
-        )),
-        _ => panic!("unable to take keys of {}", val.kind()),
-    }
-}
-
-struct Bind<I>(I, Context, String);
-impl<I> std::iter::Iterator for Bind<I>
-where
-    I: std::iter::Iterator<Item = Context>,
-{
-    type Item = Context;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let it = &mut self.0;
-        let name = self.2.as_str();
-        it.next().map(|(_, v)| {
-            let (mut env, val) = self.1.clone();
-            env.set(name, v);
-            (env, val)
-        })
-    }
-}
-fn setenv(name: impl AsRef<str>, fval: impl Filter) -> impl Filter {
-    CloseFilter(move |ctx: Context| Bind(fval.feval(ctx.clone()), ctx, name.as_ref().to_string()))
-}
-fn getenv(name: impl AsRef<str>) -> impl Filter {
-    CloseFilter(move |(env, _): Context| {
-        let val = env.get(&name).unwrap_or(Value::Null);
-        once((env, val))
-    })
-}
-
-impl<F: Filter + 'static> std::ops::BitOr<F> for DynFilter {
-    type Output = DynFilter;
-
-    fn bitor(mut self, mut rhs: F) -> Self::Output {
-        let rhs = Rc::new(rhs);
-        DynFilter(Rc::new(move |ctx| {
-            let mut it = self.0(ctx);
-            let rhs = rhs.clone();
-            Box::new(it.flat_map(move |ctx| rhs.feval(ctx)))
-        }))
-    }
-}
-impl<F, Cf, Cout> std::ops::BitOr<F> for CloseFilter<Cf>
-where
-    F: Filter + 'static,
-    Cf: Fn(Context) -> Cout + 'static,
-    Cout: Iterator<Item = Context> + 'static,
-{
-    type Output = DynFilter;
-    fn bitor(mut self, mut rhs: F) -> Self::Output {
-        let rhs = Rc::new(rhs);
-        DynFilter(Rc::new(move |ctx| {
-            let mut it = self.0(ctx);
-            let rhs = rhs.clone();
-            Box::new(it.flat_map(move |ctx| rhs.feval(ctx)))
-        }))
-    }
-}
-impl<F> std::ops::BitOr<F> for Value
-where
-    F: Filter,
-{
-    type Output = F::Out;
-
-    fn bitor(self, rhs: F) -> Self::Output {
-        rhs.feval((Env::new(), self))
-    }
-}
-
 macro_rules! json {
     ([ $($val:tt),* ]) => { Value::Array(vec![ $(json!($val)),* ]) };
     ({ $($key:literal : $val:tt),* }) => {
@@ -554,7 +211,9 @@ enum F {
     Set(String, Box<F>),
     Get(String),
     Pipe(Vec<F>),
+    Call(String, Vec<F>),
 }
+
 enum FPath {
     Done,
     Single(Context),
@@ -564,25 +223,19 @@ impl Iterator for FPath {
     type Item = Context;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            FPath::Done => None,
-            FPath::Single(_) => {
-                let ctx = match std::mem::replace(self, FPath::Done) {
-                    FPath::Single(ctx) => ctx,
-                    _ => unreachable!("outer match"),
-                };
-                Some(ctx)
-            }
-            FPath::Stream(f) => match f.next() {
-                Some(ctx) => Some(ctx),
-                None => {
-                    *self = FPath::Done;
-                    None
-                }
+        let ret: Option<Context>;
+        (ret, *self) = match std::mem::replace(self, FPath::Done) {
+            FPath::Done => (None, FPath::Done),
+            FPath::Single(ctx) => (Some(ctx), FPath::Done),
+            FPath::Stream(mut f) => match f.next() {
+                Some(ctx) => (Some(ctx), FPath::Stream(f)),
+                None => (None, FPath::Done),
             },
-        }
+        };
+        ret
     }
 }
+
 impl F {
     fn fpath(ctx: Context, ctx0: &Context, f: &F) -> FPath {
         // mostly translating
@@ -594,7 +247,6 @@ impl F {
         //    .[.|f1] | .[.|f2]
         // doesn't work because .|f2 becomes a different value
         // We special case for literals (.foo/.["foo"]/.[1]) or .[.]
-        // because we don't need to make much of a
         match f {
             F::Literal(lit) => FPath::Single((ctx.0, ctx.1[lit].clone())),
             F::Dot => FPath::Single((ctx.0, ctx.1[&ctx0.1].clone())),
@@ -604,60 +256,31 @@ impl F {
             )),
         }
     }
-}
-type FStream = Box<dyn Iterator<Item = Context>>;
-enum FIter {
-    Done,
-    Dot(Context),
-    Spread(Context),
-    Stream(FStream),
-}
-impl Iterator for FIter {
-    type Item = Context;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let ret: Option<Self::Item>;
-        (ret, *self) = match std::mem::replace(self, FIter::Done) {
-            FIter::Done => (None, FIter::Done),
-            FIter::Dot(ctx) => (Some(ctx), FIter::Done),
-
-            FIter::Spread((env, Value::Array(mut es))) => match es.len() {
-                0 | 1 => (es.pop().map(|e| (env, e)), FIter::Done),
-                _ => (
-                    Some((env.clone(), es.pop().unwrap())),
-                    FIter::Spread((env, Value::Array(es))),
-                ),
-            },
-            FIter::Spread((env, Value::Object(mut fs))) => match fs.len() {
-                0 | 1 => (fs.pop().map(|(_, v)| (env, v)), FIter::Done),
-                _ => (
-                    Some((env.clone(), fs.pop().unwrap().1)),
-                    FIter::Spread((env, Value::Object(fs))),
-                ),
-            },
-            FIter::Spread((_env, val)) => panic!("cannot iterate over {} ({})", val.kind(), val),
-
-            FIter::Stream(mut fstm) => match fstm.next() {
-                Some(ctx) => (Some(ctx), FIter::Stream(fstm)),
-                None => (None, FIter::Done),
-            },
-        };
-        ret
-    }
-}
-impl Filter for F {
-    type Out = FIter;
-
-    fn feval(&self, ctx: Context) -> Self::Out {
+    fn feval(&self, ctx: Context) -> FIter {
         match self {
             // "foo", 1, null, true
-            F::Literal(val) => FIter::Dot((ctx.0, val.clone())),
+            F::Literal(val) => FIter::One((ctx.0, val.clone())),
             // .
-            F::Dot => FIter::Dot(ctx),
+            F::Dot => FIter::One(ctx),
             // .[]
-            F::Spread => FIter::Spread(ctx),
+            F::Spread => match ctx.1 {
+                Value::Array(mut es) => match es.len() {
+                    0 => FIter::Zero,
+                    1 => FIter::One((ctx.0, es.pop().unwrap())),
+                    _ => FIter::Many(Box::new(es.into_iter().map(move |v| (ctx.0.clone(), v)))),
+                },
+                Value::Object(mut fs) => match fs.len() {
+                    0 => FIter::Zero,
+                    1 => FIter::One((ctx.0, fs.pop().unwrap().1)),
+                    _ => FIter::Many(Box::new(
+                        fs.into_iter().map(move |(_, v)| (ctx.0.clone(), v)),
+                    )),
+                },
+                _ => panic!("cannot iterate over {} ({})", ctx.1.kind(), ctx.1),
+            },
             // [f1, f2, ..]
-            F::Array(fs) => FIter::Dot((
+            F::Array(fs) => FIter::One((
                 ctx.0.clone(),
                 Value::Array(
                     fs.iter()
@@ -667,15 +290,20 @@ impl Filter for F {
                 ),
             )),
             // {}
-            F::Object(kfs) if kfs.is_empty() => FIter::Dot((ctx.0, Value::Object(vec![]))),
+            F::Object(kfs) if kfs.is_empty() => FIter::One((ctx.0, Value::Object(vec![]))),
             // {"k1": f1, "k2": f2, ..}
             F::Object(kfs) => {
                 let mut it = kfs.iter().cloned();
                 let hd = it.next().unwrap();
-                let mut prod: Box<dyn Iterator<Item = Vec<(String, Value)>>> = Box::new(
-                    hd.1.feval(ctx.clone())
-                        .map(move |(_, v)| vec![(hd.0.clone(), v)]),
-                );
+                let mut prod: Box<dyn Iterator<Item = Vec<(String, Value)>>> =
+                    match hd.1.feval(ctx.clone()) {
+                        FIter::Zero => return FIter::Zero,
+                        FIter::One((_, val)) => todo!(),
+                        fit => Box::new(
+                            hd.1.feval(ctx.clone())
+                                .map(move |(_, v)| vec![(hd.0.clone(), v)]),
+                        ),
+                    };
                 for (k, f) in it {
                     let ctx = ctx.clone();
                     prod = Box::new(prod.flat_map(move |kvs| {
@@ -689,10 +317,10 @@ impl Filter for F {
                     }))
                 }
                 let fstm = Box::new(prod.map(move |kvs| (ctx.0.clone(), Value::Object(kvs))));
-                FIter::Stream(fstm)
+                FIter::Many(fstm)
             }
             // ? weird case
-            F::Path(fs) if fs.is_empty() => FIter::Done,
+            F::Path(fs) if fs.is_empty() => FIter::Zero,
             // .[f1][f2] ..
             F::Path(fs) => {
                 let mut it = fs.iter();
@@ -704,14 +332,14 @@ impl Filter for F {
                     let f = f.clone();
                     Box::new(it.flat_map(move |ctx| F::fpath(ctx, ctx0.clone().as_ref(), &f)))
                 });
-                FIter::Stream(fstm)
+                FIter::Many(fstm)
             }
             // f as $name
             F::Set(name, fval) => {
                 let mut it = fval.feval(ctx.clone());
                 let (env, val) = ctx;
                 let name = name.clone();
-                FIter::Stream(Box::new(it.map(move |(_, v)| {
+                FIter::Many(Box::new(it.map(move |(_, v)| {
                     let mut env = env.clone();
                     env.set(&name, v);
                     (env, val.clone())
@@ -720,20 +348,57 @@ impl Filter for F {
             // $name
             F::Get(name) => {
                 let val = ctx.0.get(name).unwrap_or(Value::Null);
-                FIter::Dot((ctx.0, val))
+                FIter::One((ctx.0, val))
             }
             // ? weird case
-            F::Pipe(fs) if fs.is_empty() => FIter::Done,
+            F::Pipe(fs) if fs.is_empty() => FIter::Zero,
             // f1 | f2 | ..
             F::Pipe(fs) => {
                 let mut it = fs.iter();
                 let mut fstm: FStream = Box::new(it.next().unwrap().feval(ctx));
-                FIter::Stream(it.fold(fstm, |it, f| {
+                FIter::Many(it.fold(fstm, |it, f| {
                     let f = f.clone();
                     Box::new(it.flat_map(move |ctx| f.feval(ctx)))
                 }))
             }
+
+            // function defined in wider scope
+            F::Call(name, args) => {
+                //
+                todo!()
+            }
         }
+    }
+}
+type FStream = Box<dyn Iterator<Item = Context>>;
+enum FIt<I: Iterator> {
+    Zero,
+    One(I::Item),
+    Many(I),
+}
+type FIter = FIt<FStream>;
+impl Iterator for FIter {
+    type Item = Context;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ret: Option<Self::Item>;
+        (ret, *self) = match std::mem::replace(self, FIter::Zero) {
+            FIter::Zero => (None, FIter::Zero),
+            FIter::One(ctx) => (Some(ctx), FIter::Zero),
+            FIter::Many(mut fstm) => match fstm.next() {
+                Some(ctx) => (Some(ctx), FIter::Many(fstm)),
+                None => (None, FIter::Zero),
+            },
+        };
+        ret
+    }
+}
+
+impl std::ops::BitOr<F> for Value {
+    type Output = FIter;
+
+    fn bitor(self, rhs: F) -> Self::Output {
+        rhs.feval((Env::new(), self))
     }
 }
 
