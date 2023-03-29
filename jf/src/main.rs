@@ -169,7 +169,7 @@ impl VIndex for std::ops::Range<Option<i64>> {
                     // bound between 0..len
                     *n = (*n).clamp(0, max);
                 }
-                let idx = (usize::try_from(nm[0]).unwrap()..usize::try_from(nm[1]).unwrap());
+                let idx = usize::try_from(nm[0]).unwrap()..usize::try_from(nm[1]).unwrap();
                 println!("range: {idx:?}");
                 Ok(Value::Array(es[idx].to_vec()))
             }
@@ -241,7 +241,7 @@ impl Env {
                     int: vec![kv],
                 }
             }
-            Env::Owned { ext, int } => int.push(kv),
+            Env::Owned { int, .. } => int.push(kv),
         }
     }
     fn get(&self, key: impl AsRef<str>) -> Option<Value> {
@@ -250,7 +250,7 @@ impl Env {
             Env::Borrowed(ext) => ext.get(key),
             Env::Owned { ext, int } => int
                 .iter()
-                .find(|(k, v)| k.as_str() == key.as_ref())
+                .find(|(k, _)| k.as_str() == key.as_ref())
                 .map(|(_, v)| v.clone())
                 .or_else(|| ext.get(key)),
         }
@@ -397,7 +397,7 @@ impl F {
             }
             F::Object(kvs) => {
                 let mut values = true;
-                for (k, f) in kvs.iter_mut() {
+                for (_, f) in kvs.iter_mut() {
                     f.normalize();
                     values &= matches!(*f, F::Literal(_));
                 }
@@ -469,10 +469,7 @@ impl F {
                     match hd.1.eval(ctx.clone()) {
                         FIter::Zero => return FIter::Zero,
                         FIter::One((_, val)) => FIt::One(vec![(hd.0, val)]),
-                        fit => FIt::Many(Box::new(
-                            hd.1.eval(ctx.clone())
-                                .map(move |(_, v)| vec![(hd.0.clone(), v)]),
-                        )),
+                        fit => FIt::Many(Box::new(fit.map(move |(_, v)| vec![(hd.0.clone(), v)]))),
                     };
                 for (k, f) in it {
                     let ctx = ctx.clone();
@@ -483,7 +480,7 @@ impl F {
                             kvs.push((k, v));
                             FIt::One(kvs)
                         }
-                        (kvs, ctxs) => FIt::Many(Box::new(kvs.flat_map(move |kvs| {
+                        (kvs, _) => FIt::Many(Box::new(kvs.flat_map(move |kvs| {
                             let k = k.clone();
                             let next = f.eval(ctx.clone()).map(move |(_, v)| (k.clone(), v));
                             next.map(move |kv| {
@@ -520,14 +517,14 @@ impl F {
             }
             // f as $name
             F::Set(name, fval) => {
-                let mut it = fval.eval(ctx.clone());
+                let it = fval.eval(ctx.clone());
                 let (env, val) = ctx;
                 let name = name.clone();
-                FIter::Many(Box::new(it.map(move |(_, v)| {
+                it.flatter_map(move |(_, v)| {
                     let mut env = env.clone();
                     env.set(&name, v);
-                    (env, val.clone())
-                })))
+                    FIt::One((env, val.clone()))
+                })
             }
             // $name
             F::Get(name) => {
@@ -539,15 +536,15 @@ impl F {
             // f1 | f2 | ..
             F::Pipe(fs) => {
                 let mut it = fs.iter();
-                let mut fstm: FStream = Box::new(it.next().unwrap().eval(ctx));
-                FIter::Many(it.fold(fstm, |it, f| {
+                let fstm: FIter = it.next().unwrap().eval(ctx);
+                it.fold(fstm, |it, f| {
                     let f = f.clone();
-                    Box::new(it.flat_map(move |ctx| f.eval(ctx)))
-                }))
+                    it.flatter_map(move |ctx| f.eval(ctx))
+                })
             }
 
             // function defined in wider scope
-            F::Call(name, args) => {
+            F::Call(_name, _args) => {
                 todo!()
             }
         }
@@ -609,13 +606,13 @@ impl Display for F {
             F::Set(name, g) => {
                 if matches!(
                     **g,
-                    (F::Literal(_)
+                    F::Literal(_)
                         | F::Dot
                         | F::Spread
                         | F::Path(_)
                         | F::Array(_)
                         | F::Object(_)
-                        | F::Get(_))
+                        | F::Get(_)
                 ) {
                     write!(f, "{g} as ${name}")
                 } else {
@@ -701,77 +698,65 @@ impl std::ops::BitOr<F> for Value {
 mod parse {
     use crate::FPath;
 
-    use super::{FIt, Value as V, F};
-    use nom::bytes::complete::{escaped_transform, tag, take, take_while};
+    use super::{Value as V, F};
+    use nom::bytes::complete::{escaped, escaped_transform, tag, take, take_while};
     use nom::character::complete::{digit1, multispace0, multispace1};
-    use nom::character::is_hex_digit;
-    use nom::combinator::{eof, map, map_res, opt, recognize, value};
+    use nom::combinator::{eof, map, map_opt, map_res, opt, recognize, value};
     use nom::error::ParseError;
-    use nom::multi::{count, fold_many0, separated_list0};
+    use nom::multi::separated_list0;
     use nom::sequence::{preceded, separated_pair, tuple};
     use nom::{
-        branch::alt, character::complete::char, multi::fold_many1, multi::many1,
-        multi::separated_list1, sequence::delimited,
+        branch::alt, character::complete::char, multi::many1, multi::separated_list1,
+        sequence::delimited,
     };
-    use nom::{Err, IResult, Needed};
-    use std::borrow::Cow;
-    use std::io::Read;
+    use nom::{Err, IResult};
 
-    fn vnull(rdr: &str) -> IResult<&str, V> {
-        let (rdr, _) = tag("null")(rdr)?;
-        Ok((rdr, V::Null))
+    fn vnull(input: &str) -> IResult<&str, V> {
+        value(V::Null, tag("null"))(input)
     }
-    fn vbool(rdr: &str) -> IResult<&str, V> {
-        let (rdr, b) = alt((value(true, tag("true")), value(false, tag("false"))))(rdr)?;
-        Ok((rdr, V::Bool(b)))
+    fn vbool(input: &str) -> IResult<&str, V> {
+        let b = alt((value(true, tag("true")), value(false, tag("false"))));
+        map(b, V::Bool)(input)
     }
-    fn vnumber(rdr: &str) -> IResult<&str, V> {
+    fn vnumber(input: &str) -> IResult<&str, V> {
         let num = recognize(preceded(opt(char('-')), digit1));
         let num = map_res(num, |ds: &str| ds.parse::<i64>());
-        map(num, V::Number)(rdr)
+        map(num, V::Number)(input)
     }
-    fn vstring(rdr: &str) -> IResult<&str, V> {
-        let (rdr, s) = string(rdr)?;
-        Ok((rdr, V::String(s)))
+    fn vstring(input: &str) -> IResult<&str, V> {
+        map(string, V::String)(input)
     }
-    fn varray(rdr: &str) -> IResult<&str, V> {
+    fn varray(input: &str) -> IResult<&str, V> {
         let elems = separated_list0(punct(','), vany);
-        map(delimited(punct('['), elems, punct(']')), V::Array)(rdr)
+        map(delimited(punct('['), elems, punct(']')), V::Array)(input)
     }
-    fn vobject(rdr: &str) -> IResult<&str, V> {
+    fn vobject(input: &str) -> IResult<&str, V> {
         let kv_pair = separated_pair(string, punct(':'), vany);
         let kv_pairs = separated_list0(char(','), kv_pair);
         let obj = delimited(punct('{'), kv_pairs, punct('}'));
-        map(obj, V::Object)(rdr)
+        map(obj, V::Object)(input)
     }
-    fn vany(rdr: &str) -> IResult<&str, V> {
-        alt((vnull, vbool, vnumber, vstring, varray, vobject))(rdr)
+    fn vany(input: &str) -> IResult<&str, V> {
+        alt((vnull, vbool, vnumber, vstring, varray, vobject))(input)
     }
 
-    pub(crate) fn json(rdr: &str) -> Result<V, nom::Err<nom::error::Error<&str>>> {
-        let (rest, val) = delimited(multispace0, vany, multispace0)(rdr)?;
+    pub(crate) fn json(input: &str) -> Result<V, nom::Err<nom::error::Error<&str>>> {
+        let (rest, val) = delimited(multispace0, vany, multispace0)(input)?;
         eof(rest)?;
         Ok(val)
     }
 
     // json abnf https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON
-    fn string(rdr: &str) -> IResult<&str, String> {
+    fn string(input: &str) -> IResult<&str, String> {
         fn unescaped(c: u64) -> bool {
             (c >= 0x20 && c <= 0x21) || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x10ffff)
-        };
-        fn escaped(rdr: &str) -> IResult<&str, char> {
-            fn uniesc(rdr: &str) -> IResult<&str, char> {
-                let (rdr, _) = tag("\\u")(rdr)?;
-                let (rdr, ds) =
-                    map_res(take(4usize), |out: &str| u32::from_str_radix(out, 16))(rdr)?;
-                let c = char::from_u32(ds);
-                if let Some(c) = c {
-                    return Ok((rdr, c));
-                }
-                Result::Err(Err::Error(nom::error::Error::from_error_kind(
-                    rdr,
-                    nom::error::ErrorKind::Char,
-                )))
+        }
+        fn jescaped(input: &str) -> IResult<&str, char> {
+            fn uniesc(input: &str) -> IResult<&str, char> {
+                let from_hex = |s| u32::from_str_radix(s, 16);
+                let uni = map_res(preceded(tag("\\u"), take(4usize)), from_hex);
+                let mut uni = map_opt(uni, char::from_u32);
+                uni(input)
             }
             alt((
                 value('\"', tag("\\\"")),
@@ -783,22 +768,24 @@ mod parse {
                 value('\r', tag("\\r")),
                 value('\t', tag("\\t")),
                 uniesc,
-            ))(rdr)
+            ))(input)
         }
-        let chars = escaped_transform(take_while(|c| unescaped(u64::from(c))), '\\', escaped);
-        delimited(char('"'), chars, char('"'))(rdr)
+        let unescaped = take_while(|c: char| unescaped(u64::from(c)));
+        // TODO(jd): this should be escaped_transform, but that would hang
+        let chars = escaped(unescaped, '\\', jescaped);
+        map(delimited(char('"'), chars, char('"')), |s| s.to_string())(input)
     }
     fn punct<'s>(c: char) -> impl FnMut(&'s str) -> IResult<&str, char> {
         delimited(multispace0, char(c), multispace0)
     }
-    fn fident(rdr: &str) -> IResult<&str, &str> {
-        take_while(|c: char| c.is_alphanumeric() || c == '_')(rdr)
+    fn fident(input: &str) -> IResult<&str, &str> {
+        take_while(|c: char| c.is_alphanumeric() || c == '_')(input)
     }
 
-    fn fliteral(rdr: &str) -> IResult<&str, F> {
-        map(alt((vnull, vbool, vnumber, vstring)), F::Literal)(rdr)
+    fn fliteral(input: &str) -> IResult<&str, F> {
+        map(alt((vnull, vbool, vnumber, vstring)), F::Literal)(input)
     }
-    fn fpath(rdr: &str) -> IResult<&str, F> {
+    fn fpath(input: &str) -> IResult<&str, F> {
         // [_:_]
         let range = separated_pair(opt(fany_left), punct(':'), opt(fany_left));
         let range = map(range, |(a, b)| FPath::Range(a, b));
@@ -811,57 +798,68 @@ mod parse {
         );
         let swallow = map(opt(char('?')), |v| v.is_some());
         let path = tuple((bracket, swallow));
-        map(preceded(char('.'), many1(path)), F::Path)(rdr)
+        map(preceded(char('.'), many1(path)), F::Path)(input)
     }
-    fn fdot(rdr: &str) -> IResult<&str, F> {
-        let (rdr, _) = char('.')(rdr)?;
-        Ok((rdr, F::Dot))
+    fn fdot(input: &str) -> IResult<&str, F> {
+        let (input, _) = char('.')(input)?;
+        Ok((input, F::Dot))
     }
-    fn fspread(rdr: &str) -> IResult<&str, F> {
-        let (rdr, _) = tag(".[]")(rdr)?;
-        Ok((rdr, F::Spread))
+    fn fspread(input: &str) -> IResult<&str, F> {
+        let (input, _) = tag(".[]")(input)?;
+        Ok((input, F::Spread))
     }
-    fn fparen(rdr: &str) -> IResult<&str, F> {
-        delimited(char('('), fany, char(')'))(rdr)
+    fn fparen(input: &str) -> IResult<&str, F> {
+        delimited(char('('), fany, char(')'))(input)
     }
-    fn fget(rdr: &str) -> IResult<&str, F> {
-        map(preceded(char('$'), fident), |s| F::Get(s.to_string()))(rdr)
+    fn fget(input: &str) -> IResult<&str, F> {
+        map(preceded(char('$'), fident), |s| F::Get(s.to_string()))(input)
     }
-    fn farray(rdr: &str) -> IResult<&str, F> {
+    fn farray(input: &str) -> IResult<&str, F> {
         let elems = separated_list0(punct(','), fany);
-        map(delimited(punct('['), elems, punct(']')), F::Array)(rdr)
+        map(delimited(punct('['), elems, punct(']')), F::Array)(input)
     }
-    fn fobject(rdr: &str) -> IResult<&str, F> {
+    fn fobject(input: &str) -> IResult<&str, F> {
         let kv_pair = separated_pair(string, punct(':'), fany);
         let kv_pairs = separated_list0(char(','), kv_pair);
         let obj = delimited(punct('{'), kv_pairs, punct('}'));
-        map(obj, F::Object)(rdr)
+        map(obj, F::Object)(input)
     }
 
     // not left-recursive
-    fn fany_left(rdr: &str) -> IResult<&str, F> {
+    fn fany_left(input: &str) -> IResult<&str, F> {
         alt((
             fliteral, fpath, fspread, fdot, fget, farray, fobject, fparen,
-        ))(rdr)
+        ))(input)
     }
 
-    fn fset(rdr: &str) -> IResult<&str, F> {
+    fn fset(input: &str) -> IResult<&str, F> {
         let sep = delimited(multispace1, tag("as"), multispace1);
         let set = separated_pair(fany_left, sep, preceded(char('$'), fident));
-        map(set, |(f, name)| F::Set(name.to_string(), Box::new(f)))(rdr)
+        map(set, |(f, name)| F::Set(name.to_string(), Box::new(f)))(input)
     }
-    fn fpipe(rdr: &str) -> IResult<&str, F> {
+    fn fpipe(input: &str) -> IResult<&str, F> {
         let f = alt((fset, fany_left));
-        map(separated_list1(punct('|'), f), F::Pipe)(rdr)
+        map(separated_list1(punct('|'), f), F::Pipe)(input)
     }
 
-    fn fany(rdr: &str) -> IResult<&str, F> {
-        fpipe(rdr)
+    fn fany(input: &str) -> IResult<&str, F> {
+        fpipe(input)
     }
 
     pub(crate) fn filter(input: &str) -> Result<F, nom::Err<nom::error::Error<&str>>> {
         let (input, ret) = fany(input)?;
+        eof(input)?;
         Ok(ret)
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::*;
+
+        #[test]
+        fn test_string() {
+            assert_eq!(string(r#""abc""#), Ok(("", "abc".to_string())))
+        }
     }
 }
 
@@ -889,7 +887,7 @@ macro_rules! fjson {
     (($($t:tt)*)) => { fjson!($($t)*) };
 
     (.) => { F::Dot };
-    (.[]) => { F::Spread };
+    (.[]) => { F::Path(vec![(FPath::Spread, false)]) };
     (.$([$($f:tt)*])*) => { F::Path(vec![$( (FPath::Index(fjson!($($f)*)), false) ),*]) };
     (null) => { F::Literal(Value::Null) };
 

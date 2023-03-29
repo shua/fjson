@@ -1,0 +1,15 @@
+some json-related cli tools
+
+
+jp: pretty simple cli tool to query json input using a json pointer
+
+echo '{"a": [true, {"foo": 1}]}' | jp /a/1/foo
+# Output: 1
+
+
+jf:  more complex cli tool to query json input using jq-esque filters
+
+echo '{"a": [true, {"foo": 1}]}' | jf '.["a"][1]["foo"] as $foo | .[] | [$foo, .[1]]'
+# Output:
+# [1, {"foo": 1}]
+
