@@ -1,4 +1,4 @@
-use crate::{Value as V, F, FPath};
+use crate::{Value as V, F, FPath, FOp};
 use std::str::FromStr;
 
 grammar;
@@ -64,19 +64,25 @@ Sep0<S, T> : Vec<T> = {
 Comma<T> : Vec<T> = Sep0<",", T>;
 
 pub(crate) Filter: F = {
-	Sep1<"|", Filter1> => F::Pipe(<>),
+	Sep1<"|", Filter2> => F::Binop(FOp::Pipe, <>),
 }
 
-Filter1: F = {
-	<f:Filter0> <name:("as" "$" <FIdent>)?> => match name {
+Filter2: F = {
+	<f:Filter3> <name:("as" "$" <FIdent>)?> => match name {
 		Some(name) => F::Set(name, Box::new(f)),
 		None => f,
 	}
 }
-Filter0: F = {
+Filter3: F = {
+	Sep1<"+", Filter4> => F::Binop(FOp::Add, <>),
+}
+Filter4: F = {
+	Sep1<"*", FilterN> => F::Binop(FOp::Mul, <>),
+}
+FilterN: F = {
 	VPrimitive => F::Literal(<>),
 	FPath+ => F::Path(<>.into_iter().flat_map(|p| p.into_iter()).collect()),
-	"." => F::Dot,
+	"." => F::Path(vec![]),
 	"(" <Filter> ")",
 	"$" <FIdent> => F::Get(<>),
 	"[" <Comma<Filter>> "]" => F::Array(<>),

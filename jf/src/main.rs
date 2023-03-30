@@ -109,6 +109,56 @@ impl Value {
     fn get<'v, I: VIndex>(&'v self, idx: I) -> Result<I::Out<'v>, String> {
         idx.index_in(self)
     }
+
+    fn add(&self, rhs: &Value) -> Result<Value, String> {
+        match (self, rhs) {
+            (Value::Null, v) | (v, Value::Null) => Ok(v.clone()),
+            (Value::Number(n), Value::Number(m)) => Ok(Value::Number(n + m)),
+            (Value::String(s), Value::String(t)) => Ok(Value::String({
+                let mut s = s.clone();
+                s.push_str(t);
+                s
+            })),
+            (Value::Array(a), Value::Array(b)) => Ok(Value::Array({
+                let mut a = a.clone();
+                a.extend(b.iter().cloned());
+                a
+            })),
+            (Value::Object(a), Value::Object(b)) => Ok(Value::Object({
+                let mut a = a.clone();
+                for (k, v) in b {
+                    if a.iter().any(|(k2, _)| k == k2) {
+                        continue;
+                    }
+                    a.push((k.clone(), v.clone()));
+                }
+                a
+            })),
+            (a, b) => Err(format!(
+                "error: {} ({a}) and {} ({b}) cannot be added",
+                a.kind(),
+                b.kind()
+            )),
+        }
+    }
+
+    fn mul(&self, rhs: &Value) -> Result<Value, String> {
+        match (self, rhs) {
+            (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
+                if *n >= 1 {
+                    Ok(Value::String(s.repeat(usize::try_from(*n).unwrap())))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            (Value::Number(n), Value::Number(m)) => Ok(Value::Number(n * m)),
+            (a, b) => Err(format!(
+                "error: {} ({a}) and {} ({b}) cannot be multiplied",
+                a.kind(),
+                b.kind(),
+            )),
+        }
+    }
 }
 
 trait VIndex {
@@ -322,17 +372,32 @@ impl FPath {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FOp {
+    Pipe,
+    Add,
+    Mul,
+}
+
+impl Display for FOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FOp::Pipe => write!(f, "|"),
+            FOp::Add => write!(f, "+"),
+            FOp::Mul => write!(f, "*"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum F {
     Literal(Value),
-    Dot,
-    Spread,
     Array(Vec<F>),
     Object(Vec<(String, F)>),
     Path(Vec<(FPath, bool)>),
     Set(String, Box<F>),
     Get(String),
-    Pipe(Vec<F>),
+    Binop(FOp, Vec<F>),
     Call(String, Vec<F>),
 }
 
@@ -367,7 +432,7 @@ impl F {
         };
         match p {
             FPath::Index(F::Literal(v)) => cloned_with_env(val.get(v), env),
-            FPath::Index(F::Dot) => cloned_with_env(val.get(val0), env),
+            FPath::Index(F::Path(ps)) if ps.is_empty() => cloned_with_env(val.get(val0), env),
             FPath::Index(f) => f
                 .eval((env0.clone(), val0.clone()))
                 .flatter_map(move |(_, v)| cloned_with_env(val.get(&v).clone(), env.clone())),
@@ -404,14 +469,41 @@ impl F {
                     }
                 },
             },
-            FPath::Spread => F::Spread.eval((env, val)),
+            FPath::Spread => match val {
+                Value::Array(mut es) => match es.len() {
+                    0 => FIter::Zero,
+                    1 => FIter::One((env, es.pop().unwrap())),
+                    _ => FIter::Many(Box::new(es.into_iter().map(move |v| (env.clone(), v)))),
+                },
+                Value::Object(mut fs) => match fs.len() {
+                    0 => FIter::Zero,
+                    1 => FIter::One((env, fs.pop().unwrap().1)),
+                    _ => FIter::Many(Box::new(fs.into_iter().map(move |(_, v)| (env.clone(), v)))),
+                },
+                _ => errexit!("cannot iterate over {} ({})", val.kind(), val),
+            },
             FPath::Field(name) => cloned_with_env(val.get(name.as_str()), env),
+        }
+    }
+
+    fn precedence(&self) -> usize {
+        match self {
+            F::Literal(_) => usize::MAX,
+            F::Array(_) => usize::MAX,
+            F::Object(_) => usize::MAX,
+            F::Path(_) => usize::MAX,
+            F::Set(_, _) => 2,
+            F::Get(_) => usize::MAX,
+            F::Binop(FOp::Pipe, _) => 1,
+            F::Binop(FOp::Add, _) => 3,
+            F::Binop(FOp::Mul, _) => 4,
+            F::Call(_, _) => usize::MAX,
         }
     }
 
     fn normalize(&mut self) {
         match self {
-            F::Literal(_) | F::Dot | F::Spread | F::Get(_) => {}
+            F::Literal(_) | F::Get(_) => {}
             F::Array(es) => {
                 let mut values = true;
                 for e in es.iter_mut() {
@@ -450,15 +542,14 @@ impl F {
                     ));
                 }
             }
-            F::Path(ps) if ps.is_empty() => *self = F::Dot,
             F::Path(ps) => ps.iter_mut().map(|(p, _)| p.normalize()).collect(),
             F::Set(_, f) => f.normalize(),
-            F::Pipe(ref mut fs) if fs.len() == 1 => {
+            F::Binop(_, ref mut fs) if fs.len() == 1 => {
                 let mut f = fs.pop().unwrap();
                 f.normalize();
                 *self = f;
             }
-            F::Pipe(fs) => fs.iter_mut().map(F::normalize).collect(),
+            F::Binop(_, fs) => fs.iter_mut().map(F::normalize).collect(),
             F::Call(_, args) => args.iter_mut().map(F::normalize).collect(),
         }
     }
@@ -467,24 +558,6 @@ impl F {
         match self {
             // "foo", 1, null, true
             F::Literal(val) => FIter::One((ctx.0, val.clone())),
-            // .
-            F::Dot => FIter::One(ctx),
-            // .[]
-            F::Spread => match ctx.1 {
-                Value::Array(mut es) => match es.len() {
-                    0 => FIter::Zero,
-                    1 => FIter::One((ctx.0, es.pop().unwrap())),
-                    _ => FIter::Many(Box::new(es.into_iter().map(move |v| (ctx.0.clone(), v)))),
-                },
-                Value::Object(mut fs) => match fs.len() {
-                    0 => FIter::Zero,
-                    1 => FIter::One((ctx.0, fs.pop().unwrap().1)),
-                    _ => FIter::Many(Box::new(
-                        fs.into_iter().map(move |(_, v)| (ctx.0.clone(), v)),
-                    )),
-                },
-                _ => errexit!("cannot iterate over {} ({})", ctx.1.kind(), ctx.1),
-            },
             // [f1, f2, ..]
             F::Array(fs) => FIter::One((
                 ctx.0.clone(),
@@ -536,30 +609,26 @@ impl F {
                     )),
                 }
             }
-            // weird case, I guess it's just '.' though?
+            // .
             F::Path(fs) if fs.is_empty() => FIter::One(ctx),
             // .[f1][f2] ..
             F::Path(fs) => {
                 let mut it = fs.iter();
-                let ctx0 = Rc::new(ctx.clone());
-                let first = it.next().unwrap();
-                let first: FStream = Box::new(F::fpath(ctx.clone(), ctx0.clone().as_ref(), first));
-                let fstm = it.fold(first, |it, f| {
-                    let ctx0 = ctx0.clone();
+                let first: FIter = F::fpath(ctx.clone(), &ctx, it.next().unwrap());
+                it.fold(first, |it, f| {
+                    let ctx0 = ctx.clone();
                     let f = f.clone();
-                    Box::new(it.flat_map(move |ctx| F::fpath(ctx, ctx0.clone().as_ref(), &f)))
-                });
-                FIter::Many(fstm)
+                    it.flatter_map(move |ctx| F::fpath(ctx, &ctx0, &f))
+                })
             }
             // f as $name
             F::Set(name, fval) => {
                 let it = fval.eval(ctx.clone());
-                let (env, val) = ctx;
                 let name = name.clone();
                 it.flatter_map(move |(_, v)| {
-                    let mut env = env.clone();
+                    let mut env = ctx.0.clone();
                     env.set(&name, v);
-                    FIt::One((env, val.clone()))
+                    FIter::One((env, ctx.1.clone()))
                 })
             }
             // $name
@@ -568,15 +637,42 @@ impl F {
                 FIter::One((ctx.0, val))
             }
             // ? weird case
-            F::Pipe(fs) if fs.is_empty() => FIter::Zero,
+            F::Binop(_, fs) if fs.is_empty() => FIter::Zero,
+            F::Binop(_, fs) if fs.len() == 1 => fs[0].eval(ctx),
             // f1 | f2 | ..
-            F::Pipe(fs) => {
+            F::Binop(FOp::Pipe, fs) => {
                 let mut it = fs.iter();
                 let fstm: FIter = it.next().unwrap().eval(ctx);
                 it.fold(fstm, |it, f| {
                     let f = f.clone();
                     it.flatter_map(move |ctx| f.eval(ctx))
                 })
+            }
+            // f1 _ f2 _ ...
+            F::Binop(op @ (FOp::Add | FOp::Mul), fs) => {
+                let mut it = fs.iter().cloned();
+                let hd = it.next().unwrap();
+                let mut hd = hd.eval(ctx.clone());
+                let binop = if op == &FOp::Add {
+                    Value::add
+                } else {
+                    Value::mul
+                };
+                for f in it {
+                    let ctx = ctx.clone();
+                    hd = hd.flatter_map(move |(_, v)| {
+                        let env0 = ctx.0.clone();
+                        f.eval(ctx.clone())
+                            .flatter_map(move |(_, w)| match binop(&v, &w) {
+                                Ok(v) => FIter::One((env0.clone(), v)),
+                                Err(err) => {
+                                    eprintln!("{err}");
+                                    std::process::exit(1);
+                                }
+                            })
+                    })
+                }
+                hd
             }
 
             // function defined in wider scope
@@ -590,6 +686,10 @@ impl F {
 struct FPathDisplay<'p>(&'p [(FPath, bool)]);
 impl<'p> Display for FPathDisplay<'p> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, ".");
+        }
+
         let mut last_bracket = false;
         for (p, s) in self.0 {
             if matches!(p, FPath::Field(_)) || !last_bracket {
@@ -620,8 +720,6 @@ impl Display for F {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             F::Literal(v) => Display::fmt(v, f),
-            F::Dot => Display::fmt(".", f),
-            F::Spread => Display::fmt(".[]", f),
             F::Array(es) if es.is_empty() => write!(f, "[]"),
             F::Array(es) => {
                 write!(f, "[{}", es[0])?;
@@ -640,34 +738,27 @@ impl Display for F {
             }
             F::Path(ps) => write!(f, "{}", FPathDisplay(ps)),
             F::Set(name, g) => {
-                if matches!(
-                    **g,
-                    F::Literal(_)
-                        | F::Dot
-                        | F::Spread
-                        | F::Path(_)
-                        | F::Array(_)
-                        | F::Object(_)
-                        | F::Get(_)
-                ) {
+                if g.precedence() > self.precedence() {
                     write!(f, "{g} as ${name}")
                 } else {
                     write!(f, "({g}) as ${name}")
                 }
             }
             F::Get(name) => write!(f, "${name}"),
-            F::Pipe(fs) if fs.is_empty() => Ok(()),
-            F::Pipe(fs) => {
-                fn pipeseg(p: &F, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    match p {
-                        F::Pipe(_) => write!(f, "({p})"),
-                        _ => write!(f, "{p}"),
+            F::Binop(_, fs) if fs.is_empty() => Ok(()),
+            F::Binop(op, fs) => {
+                fn factor(g: &F, p: usize, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    if g.precedence() > p {
+                        write!(f, "{g}")
+                    } else {
+                        write!(f, "({g})")
                     }
                 }
-                pipeseg(&fs[0], f)?;
+                let p = self.precedence();
+                factor(&fs[0], p, f)?;
                 for g in &fs[1..] {
-                    write!(f, " | ")?;
-                    pipeseg(g, f)?;
+                    write!(f, " {op} ")?;
+                    factor(g, p, f)?;
                 }
                 Ok(())
             }
@@ -756,7 +847,7 @@ lalrpop_mod!(grammar);
 macro_rules! fjson {
     (($($t:tt)*)) => { fjson!($($t)*) };
 
-    (.) => { F::Dot };
+    (.) => { F::Path(vec![]) };
     (.[]) => { F::Path(vec![(FPath::Spread, false)]) };
     (.$([$($f:tt)*])*) => { F::Path(vec![$( (FPath::Index(fjson!($($f)*)), false) ),*]) };
     (null) => { F::Literal(Value::Null) };
@@ -847,7 +938,7 @@ macro_rules! fjson {
     };
 
     // pipes simple case
-    ($f:tt | $($g:tt)|*) => { F::Pipe(vec![ fjson!($f), $(fjson!($g)),*]) };
+    ($f:tt | $($g:tt)|*) => { F::Binop(FOp::Pipe, vec![ fjson!($f), $(fjson!($g)),*]) };
     // pipes token muncher
     ($f:tt $(as @$name:ident)? | $($rest:tt)*) => {
         fjson!(@@pipe [fjson!($f $(as @$name)?)] $($rest)*)
@@ -858,7 +949,7 @@ macro_rules! fjson {
     (@$name:ident $(as @$key:ident)? | $($rest:tt)*) => {
         fjson!(@@pipe [fjson!(@$name $(as @$key)?)] $($rest)*)
     };
-    (@@pipe [$($f:expr),*]) => { F::Pipe(vec![ $($f),* ]) };
+    (@@pipe [$($f:expr),*]) => { F::Binop(FOp::Pipe, vec![ $($f),* ]) };
     (@@pipe [$($f:expr),*] $g:tt $(as @$name:ident)? $(| $($rest:tt)*)?) => {
         fjson!(@@pipe [$($f,)* fjson!($g $(as @$name)?)] $($($rest)*)?)
     };
@@ -965,7 +1056,7 @@ fn main() {
         }
     };
 
-    println!("filter: {f:?}");
+    println!("filter: {f}");
 
     let mut input = String::new();
     std::io::stdin()
