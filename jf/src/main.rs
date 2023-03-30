@@ -159,6 +159,19 @@ impl Value {
             )),
         }
     }
+
+    fn truthy(&self) -> bool {
+        match self {
+            Value::Null | Value::Bool(false) => false,
+            _ => true,
+        }
+    }
+    fn or(&self, rhs: &Value) -> Result<Value, String> {
+        Ok(Value::Bool(self.truthy() || rhs.truthy()))
+    }
+    fn and(&self, rhs: &Value) -> Result<Value, String> {
+        Ok(Value::Bool(self.truthy() && rhs.truthy()))
+    }
 }
 
 trait VIndex {
@@ -377,6 +390,8 @@ enum FOp {
     Pipe,
     Add,
     Mul,
+    Or,
+    And,
 }
 
 impl Display for FOp {
@@ -385,6 +400,8 @@ impl Display for FOp {
             FOp::Pipe => write!(f, "|"),
             FOp::Add => write!(f, "+"),
             FOp::Mul => write!(f, "*"),
+            FOp::Or => write!(f, "or"),
+            FOp::And => write!(f, "and"),
         }
     }
 }
@@ -497,6 +514,8 @@ impl F {
             F::Binop(FOp::Pipe, _) => 1,
             F::Binop(FOp::Add, _) => 3,
             F::Binop(FOp::Mul, _) => 4,
+            F::Binop(FOp::Or, _) => 5,
+            F::Binop(FOp::And, _) => 6,
             F::Call(_, _) => usize::MAX,
         }
     }
@@ -649,14 +668,16 @@ impl F {
                 })
             }
             // f1 _ f2 _ ...
-            F::Binop(op @ (FOp::Add | FOp::Mul), fs) => {
+            F::Binop(op, fs) => {
                 let mut it = fs.iter().cloned();
                 let hd = it.next().unwrap();
                 let mut hd = hd.eval(ctx.clone());
-                let binop = if op == &FOp::Add {
-                    Value::add
-                } else {
-                    Value::mul
+                let binop = match op {
+                    FOp::Pipe => unreachable!("outer match"),
+                    FOp::Add => Value::add,
+                    FOp::Mul => Value::mul,
+                    FOp::Or => Value::or,
+                    FOp::And => Value::and,
                 };
                 for f in it {
                     let ctx = ctx.clone();
