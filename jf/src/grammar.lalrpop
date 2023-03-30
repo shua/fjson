@@ -1,0 +1,84 @@
+use crate::{Value as V, F, FPath};
+use std::str::FromStr;
+
+grammar;
+
+VString: String = {
+	// from https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON
+	// string = %x22 *char %x22 ; %x22 = '"'
+	// char = unescaped / escape (%x22 / %x5c / %x2f / %x62 / %x66 / %x6e / %x72 / %x74 / %x75 4HEXDIG)
+	//                            '"'    '\'    '/'    'b'    'f'    'n'    'r'    't'    'u'
+	// escape = %x5c ; \
+	// unescaped = %x20-21 / %x23-5b / %x5d-10ffff
+	//             ' '-'!'   '#'-'['   ']'-\U0010ffff
+	<s:r#""([ !#-\[\]-\U0010ffff]|\\["\\/bfnrt]|\\u[0-9][0-9][0-9][0-9])*""#> => {
+		String::from(&s[1..s.len()-1])
+	}
+};
+
+VPrimitive: V = {
+	"null" => V::Null,
+	"0" => V::Number(0),
+	r"[1-9][0-9]*" => V::Number(i64::from_str(<>).unwrap()),
+	"true" => V::Bool(true),
+	"false" => V::Bool(false),
+	VString => V::String(<>),
+};
+
+KVPair<V>: (String, V) = {
+	<k:VString> ":" <v:V> => (k, v),
+};
+
+pub(crate) Value: V = {
+	VPrimitive,
+	"[" <Comma<Value>> "]" => V::Array(<>),
+	"{" <Comma<KVPair<Value>>> "}" => V::Object(<>),
+}
+
+FIdent: String = {
+	r"[a-zA-Z_][0-0a-zA-Z_]*" => <>.to_string(),
+}
+
+FPathIndex: (FPath, bool) = {
+	"[" <start:Filter?> <end:(":" <Filter?>)?> "]" <s:"?"?> => match (start, end) {
+		(start, Some(end)) => (FPath::Range(start, end), s.is_some()),
+		(Some(idx), None) => (FPath::Index(idx), s.is_some()),
+		(None, None) => (FPath::Spread, s.is_some()),
+	}
+}
+FPath: Vec<(FPath, bool)> = {
+	"." <FPathIndex+> => <>,
+	"." <fld:FIdent> <s:"?"?> => vec![(FPath::Field(fld), s.is_some())],
+}
+
+Sep1<S, T>: Vec<T> = {
+	<mut vs:(<T> S)*> <v:T> => {
+		vs.push(v);
+		vs
+	}
+}
+Sep0<S, T> : Vec<T> = {
+	=> vec![],
+	Sep1<S, T>,
+}
+Comma<T> : Vec<T> = Sep0<",", T>;
+
+pub(crate) Filter: F = {
+	Sep1<"|", Filter1> => F::Pipe(<>),
+}
+
+Filter1: F = {
+	<f:Filter0> <name:("as" "$" <FIdent>)?> => match name {
+		Some(name) => F::Set(name, Box::new(f)),
+		None => f,
+	}
+}
+Filter0: F = {
+	VPrimitive => F::Literal(<>),
+	FPath+ => F::Path(<>.into_iter().flat_map(|p| p.into_iter()).collect()),
+	"." => F::Dot,
+	"(" <Filter> ")",
+	"$" <FIdent> => F::Get(<>),
+	"[" <Comma<Filter>> "]" => F::Array(<>),
+	"{" <Comma<KVPair<Filter>>> "}" => F::Object(<>),
+};

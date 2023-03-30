@@ -2,6 +2,16 @@
 
 use std::{fmt::Display, io::Read, rc::Rc};
 
+use codespan_reporting::{
+    diagnostic::{Diagnostic, Label},
+    files::SimpleFile,
+    term::{
+        self,
+        termcolor::{ColorChoice, StandardStream},
+    },
+};
+use lalrpop_util::lalrpop_mod;
+
 macro_rules! errexit {
     ($fmt:literal $(, $arg:expr)*) => { errexit!($fmt $(, $arg)* ; 1) };
     ($fmt:literal $(, $arg:expr)* ; $status:expr) => {{
@@ -197,7 +207,6 @@ impl<'idx> VIndex for std::ops::Range<Option<&'idx Value>> {
     }
 }
 
-#[derive(Clone)]
 enum Env {
     Empty,
     Borrowed(Rc<Env>),
@@ -209,6 +218,18 @@ enum Env {
 impl Default for Env {
     fn default() -> Self {
         Env::Empty
+    }
+}
+impl Clone for Env {
+    fn clone(&self) -> Self {
+        match self {
+            Env::Empty => Env::Empty,
+            Env::Borrowed(p) => Env::Borrowed(p.clone()),
+            Env::Owned { ext, int } => Env::Borrowed(Rc::new(Env::Owned {
+                ext: ext.clone(),
+                int: int.clone(),
+            })),
+        }
     }
 }
 impl Env {
@@ -255,6 +276,13 @@ impl Env {
                 .or_else(|| ext.get(key)),
         }
     }
+
+    fn borrowed(self) -> Env {
+        match self {
+            Env::Owned { .. } => Env::Borrowed(Rc::new(self)),
+            env => env,
+        }
+    }
 }
 
 type Context = (Env, Value);
@@ -282,7 +310,15 @@ enum FPath {
 
 impl FPath {
     fn normalize(&mut self) {
-        // todo
+        match self {
+            FPath::Index(f) => f.normalize(),
+            FPath::Range(s, e) => {
+                s.as_mut().map(F::normalize);
+                e.as_mut().map(F::normalize);
+            }
+            FPath::Spread => {}
+            FPath::Field(_) => {}
+        }
     }
 }
 
@@ -695,173 +731,7 @@ impl std::ops::BitOr<F> for Value {
     }
 }
 
-mod parse {
-    use crate::FPath;
-
-    use super::{Value as V, F};
-    use nom::bytes::complete::{escaped, escaped_transform, tag, take, take_while};
-    use nom::character::complete::{digit1, multispace0, multispace1};
-    use nom::combinator::{eof, map, map_opt, map_res, opt, recognize, value};
-    use nom::error::ParseError;
-    use nom::multi::separated_list0;
-    use nom::sequence::{preceded, separated_pair, tuple};
-    use nom::{
-        branch::alt, character::complete::char, multi::many1, multi::separated_list1,
-        sequence::delimited,
-    };
-    use nom::{Err, IResult};
-
-    fn vnull(input: &str) -> IResult<&str, V> {
-        value(V::Null, tag("null"))(input)
-    }
-    fn vbool(input: &str) -> IResult<&str, V> {
-        let b = alt((value(true, tag("true")), value(false, tag("false"))));
-        map(b, V::Bool)(input)
-    }
-    fn vnumber(input: &str) -> IResult<&str, V> {
-        let num = recognize(preceded(opt(char('-')), digit1));
-        let num = map_res(num, |ds: &str| ds.parse::<i64>());
-        map(num, V::Number)(input)
-    }
-    fn vstring(input: &str) -> IResult<&str, V> {
-        map(string, V::String)(input)
-    }
-    fn varray(input: &str) -> IResult<&str, V> {
-        let elems = separated_list0(punct(','), vany);
-        map(delimited(punct('['), elems, punct(']')), V::Array)(input)
-    }
-    fn vobject(input: &str) -> IResult<&str, V> {
-        let kv_pair = separated_pair(string, punct(':'), vany);
-        let kv_pairs = separated_list0(char(','), kv_pair);
-        let obj = delimited(punct('{'), kv_pairs, punct('}'));
-        map(obj, V::Object)(input)
-    }
-    fn vany(input: &str) -> IResult<&str, V> {
-        alt((vnull, vbool, vnumber, vstring, varray, vobject))(input)
-    }
-
-    pub(crate) fn json(input: &str) -> Result<V, nom::Err<nom::error::Error<&str>>> {
-        let (rest, val) = delimited(multispace0, vany, multispace0)(input)?;
-        eof(rest)?;
-        Ok(val)
-    }
-
-    // json abnf https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON
-    fn string(input: &str) -> IResult<&str, String> {
-        fn unescaped(c: u64) -> bool {
-            (c >= 0x20 && c <= 0x21) || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x10ffff)
-        }
-        fn jescaped(input: &str) -> IResult<&str, char> {
-            fn uniesc(input: &str) -> IResult<&str, char> {
-                let from_hex = |s| u32::from_str_radix(s, 16);
-                let uni = map_res(preceded(tag("\\u"), take(4usize)), from_hex);
-                let mut uni = map_opt(uni, char::from_u32);
-                uni(input)
-            }
-            alt((
-                value('\"', tag("\\\"")),
-                value('\\', tag("\\\\")),
-                value('/', tag("\\/")),
-                value('\x62', tag("\\b")),
-                value('\x66', tag("\\f")),
-                value('\n', tag("\\n")),
-                value('\r', tag("\\r")),
-                value('\t', tag("\\t")),
-                uniesc,
-            ))(input)
-        }
-        let unescaped = take_while(|c: char| unescaped(u64::from(c)));
-        // TODO(jd): this should be escaped_transform, but that would hang
-        let chars = escaped(unescaped, '\\', jescaped);
-        map(delimited(char('"'), chars, char('"')), |s| s.to_string())(input)
-    }
-    fn punct<'s>(c: char) -> impl FnMut(&'s str) -> IResult<&str, char> {
-        delimited(multispace0, char(c), multispace0)
-    }
-    fn fident(input: &str) -> IResult<&str, &str> {
-        take_while(|c: char| c.is_alphanumeric() || c == '_')(input)
-    }
-
-    fn fliteral(input: &str) -> IResult<&str, F> {
-        map(alt((vnull, vbool, vnumber, vstring)), F::Literal)(input)
-    }
-    fn fpath(input: &str) -> IResult<&str, F> {
-        // [_:_]
-        let range = separated_pair(opt(fany_left), punct(':'), opt(fany_left));
-        let range = map(range, |(a, b)| FPath::Range(a, b));
-        // [_]
-        let idx = map(fany, FPath::Index);
-
-        let bracket = map(
-            delimited(char('['), opt(alt((range, idx))), char(']')),
-            |idx| idx.unwrap_or(FPath::Spread),
-        );
-        let swallow = map(opt(char('?')), |v| v.is_some());
-        let path = tuple((bracket, swallow));
-        map(preceded(char('.'), many1(path)), F::Path)(input)
-    }
-    fn fdot(input: &str) -> IResult<&str, F> {
-        let (input, _) = char('.')(input)?;
-        Ok((input, F::Dot))
-    }
-    fn fspread(input: &str) -> IResult<&str, F> {
-        let (input, _) = tag(".[]")(input)?;
-        Ok((input, F::Spread))
-    }
-    fn fparen(input: &str) -> IResult<&str, F> {
-        delimited(char('('), fany, char(')'))(input)
-    }
-    fn fget(input: &str) -> IResult<&str, F> {
-        map(preceded(char('$'), fident), |s| F::Get(s.to_string()))(input)
-    }
-    fn farray(input: &str) -> IResult<&str, F> {
-        let elems = separated_list0(punct(','), fany);
-        map(delimited(punct('['), elems, punct(']')), F::Array)(input)
-    }
-    fn fobject(input: &str) -> IResult<&str, F> {
-        let kv_pair = separated_pair(string, punct(':'), fany);
-        let kv_pairs = separated_list0(char(','), kv_pair);
-        let obj = delimited(punct('{'), kv_pairs, punct('}'));
-        map(obj, F::Object)(input)
-    }
-
-    // not left-recursive
-    fn fany_left(input: &str) -> IResult<&str, F> {
-        alt((
-            fliteral, fpath, fspread, fdot, fget, farray, fobject, fparen,
-        ))(input)
-    }
-
-    fn fset(input: &str) -> IResult<&str, F> {
-        let sep = delimited(multispace1, tag("as"), multispace1);
-        let set = separated_pair(fany_left, sep, preceded(char('$'), fident));
-        map(set, |(f, name)| F::Set(name.to_string(), Box::new(f)))(input)
-    }
-    fn fpipe(input: &str) -> IResult<&str, F> {
-        let f = alt((fset, fany_left));
-        map(separated_list1(punct('|'), f), F::Pipe)(input)
-    }
-
-    fn fany(input: &str) -> IResult<&str, F> {
-        fpipe(input)
-    }
-
-    pub(crate) fn filter(input: &str) -> Result<F, nom::Err<nom::error::Error<&str>>> {
-        let (input, ret) = fany(input)?;
-        eof(input)?;
-        Ok(ret)
-    }
-
-    #[cfg(test)]
-    mod test {
-        use super::*;
-
-        #[test]
-        fn test_string() {
-            assert_eq!(string(r#""abc""#), Ok(("", "abc".to_string())))
-        }
-    }
-}
+lalrpop_mod!(grammar);
 
 // For the most part, jf exprs are tt's, eg [...], {...}, (...), ., "foo", 4, true, null
 // however, there are 4 exceptions:
@@ -1022,26 +892,92 @@ mod test {
     }
 }
 
+fn show_parse_error(
+    name: &str,
+    input: &str,
+    err: &lalrpop_util::ParseError<usize, grammar::Token, &str>,
+) {
+    use std::io::Write as _;
+    let writer = StandardStream::stderr(ColorChoice::Auto);
+    let config = codespan_reporting::term::Config::default();
+    let file = SimpleFile::new(name, input);
+
+    let diag: Diagnostic<()>;
+    fn exp_str(exp: &[String]) -> String {
+        match exp.len() {
+            0 => format!("expected eof"),
+            1 => format!("expected {}", exp[0]),
+            _ => {
+                let mut out = String::from("expected one of: ");
+                out.push_str(&exp[0]);
+                for s in &exp[1..exp.len() - 1] {
+                    out.push_str(", ");
+                    out.push_str(s);
+                }
+                out.push_str(", or ");
+                out.push_str(&exp[exp.len() - 1]);
+                out
+            }
+        }
+    }
+    match err {
+        lalrpop_util::ParseError::InvalidToken { location } => {
+            diag = Diagnostic::error()
+                .with_message("parse error: invalid token")
+                .with_labels(vec![Label::primary((), *location..*location)]);
+        }
+        lalrpop_util::ParseError::UnrecognizedEOF { location, expected } => {
+            diag = Diagnostic::error()
+                .with_message("parse error: unrecognized eof")
+                .with_labels(vec![Label::primary((), *location..*location)])
+                .with_notes(vec![exp_str(expected)]);
+        }
+        lalrpop_util::ParseError::UnrecognizedToken { token, expected } => {
+            diag = Diagnostic::error()
+                .with_message("parse error: unrecognized token")
+                .with_labels(vec![Label::primary((), token.0..token.2)])
+                .with_notes(vec![exp_str(expected)]);
+        }
+        lalrpop_util::ParseError::ExtraToken { token } => {
+            diag = Diagnostic::error()
+                .with_message("parse error: unexpected token")
+                .with_labels(vec![Label::primary((), token.0..token.2)])
+                .with_notes(vec![exp_str(&[])]);
+        }
+        lalrpop_util::ParseError::User { error } => {
+            diag = Diagnostic::error().with_message(format!("parse error: {error}"));
+        }
+    }
+
+    term::emit(&mut writer.lock(), &config, &file, &diag).unwrap();
+}
+
 fn main() {
     let arg1 = std::env::args().skip(1).next().unwrap_or(String::new());
-    let f = match parse::filter(&arg1) {
+    let f = match grammar::FilterParser::new().parse(&arg1) {
         Ok(mut f) => {
             f.normalize();
             f
         }
         Err(err) => {
-            eprintln!("parse err: {err}");
+            show_parse_error("<arg[1]>", &arg1, &err);
             std::process::exit(1);
         }
     };
 
-    println!("filter: {f}");
+    println!("filter: {f:?}");
 
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .expect("read stdin");
-    let val = parse::json(&input).expect("json input");
+    let val = match grammar::ValueParser::new().parse(&input) {
+        Ok(v) => v,
+        Err(err) => {
+            show_parse_error("<stdin>", &input, &err);
+            std::process::exit(1);
+        }
+    };
     for (_, v) in val | f {
         println!("{v}");
     }
