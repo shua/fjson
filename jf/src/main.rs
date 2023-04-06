@@ -174,6 +174,70 @@ impl Value {
     }
 }
 
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Object(a), Value::Object(b)) => {
+                let mut a: Vec<&_> = a.iter().collect();
+                let mut b: Vec<&_> = b.iter().collect();
+                a.sort();
+                b.sort();
+                a.partial_cmp(&b)
+            }
+            (Value::Object(_), _) => Some(std::cmp::Ordering::Greater),
+            (_, Value::Object(_)) => Some(std::cmp::Ordering::Less),
+            (Value::Array(a), Value::Array(b)) => a.partial_cmp(b),
+            (Value::Array(_), _) => Some(std::cmp::Ordering::Greater),
+            (_, Value::Array(_)) => Some(std::cmp::Ordering::Less),
+            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
+            (Value::String(_), _) => Some(std::cmp::Ordering::Greater),
+            (_, Value::String(_)) => Some(std::cmp::Ordering::Less),
+            (Value::Number(a), Value::Number(b)) => a.partial_cmp(b),
+            (Value::Number(_), _) => Some(std::cmp::Ordering::Greater),
+            (_, Value::Number(_)) => Some(std::cmp::Ordering::Less),
+            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+            (Value::Bool(_), _) => Some(std::cmp::Ordering::Greater),
+            (_, Value::Bool(_)) => Some(std::cmp::Ordering::Less),
+            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+        }
+    }
+}
+
+impl Eq for Value {}
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                let mut a: Vec<_> = a.iter().chain(b.iter()).collect();
+                a.sort_by_key(|(k, _)| k);
+                let mut it = a.iter();
+                // check it by pairs
+                while let Some(a) = it.next() {
+                    let b = it.next().unwrap();
+                    if a != b {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 trait VIndex {
     type Out<'v>;
     fn index_in<'v>(self, val: &'v Value) -> Result<Self::Out<'v>, String>;
@@ -271,7 +335,7 @@ impl<'idx> VIndex for std::ops::Range<Option<&'idx Value>> {
 }
 
 enum Env {
-    Empty,
+    Root(Rc<Vec<(String, Vec<String>, F)>>),
     Borrowed(Rc<Env>),
     Owned {
         ext: Rc<Env>,
@@ -280,19 +344,27 @@ enum Env {
 }
 impl Default for Env {
     fn default() -> Self {
-        Env::Empty
+        Env::Root(Rc::new(vec![]))
     }
 }
 impl Clone for Env {
     fn clone(&self) -> Self {
         match self {
-            Env::Empty => Env::Empty,
+            Env::Root(defs) => Env::Root(defs.clone()),
             Env::Borrowed(p) => Env::Borrowed(p.clone()),
             Env::Owned { ext, int } => Env::Borrowed(Rc::new(Env::Owned {
                 ext: ext.clone(),
                 int: int.clone(),
             })),
         }
+    }
+}
+impl Display for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{")?;
+        let mut first = true;
+        self.display(&mut first, f)?;
+        write!(f, "}}")
     }
 }
 impl Env {
@@ -305,17 +377,44 @@ impl Env {
         static mut ROOT: MaybeUninit<Rc<Env>> = MaybeUninit::uninit();
         static ROOT_INIT: Once = Once::new();
         ROOT_INIT.call_once(|| unsafe {
-            ROOT.write(Rc::new(Env::Empty));
+            ROOT.write(Rc::new(Env::default()));
         });
         unsafe { ROOT.assume_init_ref().clone() }
+    }
+
+    fn display(&self, first: &mut bool, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Env::Root(defs) if defs.is_empty() => Ok(()),
+            Env::Root(defs) => {
+                write!(f, "{}/{}", defs[0].0, defs[0].1.len())?;
+                for d in &defs[1..] {
+                    write!(f, ", {}/{}", d.0, d.1.len())?;
+                }
+                *first = false;
+                Ok(())
+            }
+            Env::Borrowed(ext) => ext.display(first, f),
+            Env::Owned { ext, int } if int.is_empty() => ext.display(first, f),
+            Env::Owned { ext, int } => {
+                ext.display(first, f)?;
+                if !*first {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{} = {}", int[0].0, int[0].1)?;
+                for (k, v) in &int[1..] {
+                    write!(f, "{k} = {v}")?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn set(&mut self, key: impl Into<String>, val: impl Into<Value>) {
         let kv = (key.into(), val.into());
         match self {
-            Env::Empty => {
+            Env::Root(defs) => {
                 *self = Env::Owned {
-                    ext: Env::root(),
+                    ext: Rc::new(Env::Root(defs.clone())),
                     int: vec![kv],
                 }
             }
@@ -330,7 +429,7 @@ impl Env {
     }
     fn get(&self, key: impl AsRef<str>) -> Option<Value> {
         match self {
-            Env::Empty => None,
+            Env::Root(_) => None,
             Env::Borrowed(ext) => ext.get(key),
             Env::Owned { ext, int } => int
                 .iter()
@@ -344,6 +443,16 @@ impl Env {
         match self {
             Env::Owned { .. } => Env::Borrowed(Rc::new(self)),
             env => env,
+        }
+    }
+
+    fn fget(&self, name: impl AsRef<str>) -> Option<(&[String], &F)> {
+        match self {
+            Env::Root(fs) => fs
+                .iter()
+                .find(|(n, _, _)| n == name.as_ref())
+                .map(|(_, a, f)| (a.as_slice(), f)),
+            Env::Borrowed(ext) | Env::Owned { ext, .. } => ext.fget(name),
         }
     }
 }
@@ -392,6 +501,9 @@ enum FOp {
     Mul,
     Or,
     And,
+    Lt,
+    Gt,
+    Eq,
 }
 
 impl Display for FOp {
@@ -402,6 +514,9 @@ impl Display for FOp {
             FOp::Mul => write!(f, "*"),
             FOp::Or => write!(f, "or"),
             FOp::And => write!(f, "and"),
+            FOp::Lt => write!(f, "<"),
+            FOp::Gt => write!(f, ">"),
+            FOp::Eq => write!(f, "=="),
         }
     }
 }
@@ -419,6 +534,45 @@ enum F {
 }
 
 impl F {
+    fn from_cmp_chain(vs: Vec<(F, std::cmp::Ordering)>, tl: F) -> F {
+        let mut it = vs.into_iter();
+        let (v, mut lastop) = match it.next() {
+            Some(v) => v,
+            None => return tl,
+        };
+        let mut vs = vec![v];
+        let mut ret = vec![];
+
+        fn fop_ord(ord: std::cmp::Ordering) -> FOp {
+            match ord {
+                std::cmp::Ordering::Less => FOp::Lt,
+                std::cmp::Ordering::Equal => FOp::Eq,
+                std::cmp::Ordering::Greater => FOp::Gt,
+            }
+        }
+
+        for (v, op) in it {
+            if op != lastop {
+                let w = v.clone();
+                vs.push(w);
+                ret.push(F::Binop(fop_ord(lastop), vs));
+                vs = vec![];
+                lastop = op;
+            }
+            vs.push(v);
+        }
+        vs.push(tl);
+
+        if ret.is_empty() {
+            F::Binop(fop_ord(lastop), vs)
+        } else {
+            if !vs.is_empty() {
+                ret.push(F::Binop(fop_ord(lastop), vs));
+            }
+            F::Binop(FOp::And, ret)
+        }
+    }
+
     fn fpath(
         (env, val): Context,
         (env0, val0): &Context,
@@ -512,10 +666,11 @@ impl F {
             F::Set(_, _) => 2,
             F::Get(_) => usize::MAX,
             F::Binop(FOp::Pipe, _) => 1,
-            F::Binop(FOp::Add, _) => 3,
-            F::Binop(FOp::Mul, _) => 4,
-            F::Binop(FOp::Or, _) => 5,
-            F::Binop(FOp::And, _) => 6,
+            F::Binop(FOp::Or, _) => 3,
+            F::Binop(FOp::And, _) => 4,
+            F::Binop(FOp::Lt | FOp::Gt | FOp::Eq, _) => 5,
+            F::Binop(FOp::Add, _) => 10,
+            F::Binop(FOp::Mul, _) => 11,
             F::Call(_, _) => usize::MAX,
         }
     }
@@ -561,15 +716,15 @@ impl F {
                     ));
                 }
             }
-            F::Path(ps) => ps.iter_mut().map(|(p, _)| p.normalize()).collect(),
+            F::Path(ps) => ps.iter_mut().for_each(|(p, _)| p.normalize()),
             F::Set(_, f) => f.normalize(),
             F::Binop(_, ref mut fs) if fs.len() == 1 => {
                 let mut f = fs.pop().unwrap();
                 f.normalize();
                 *self = f;
             }
-            F::Binop(_, fs) => fs.iter_mut().map(F::normalize).collect(),
-            F::Call(_, args) => args.iter_mut().map(F::normalize).collect(),
+            F::Binop(_, fs) => fs.iter_mut().for_each(F::normalize),
+            F::Call(_, args) => args.iter_mut().for_each(F::normalize),
         }
     }
 
@@ -668,16 +823,16 @@ impl F {
                 })
             }
             // f1 _ f2 _ ...
-            F::Binop(op, fs) => {
+            F::Binop(op @ (FOp::Add | FOp::Mul | FOp::Or | FOp::And), fs) => {
                 let mut it = fs.iter().cloned();
                 let hd = it.next().unwrap();
                 let mut hd = hd.eval(ctx.clone());
-                let binop = match op {
-                    FOp::Pipe => unreachable!("outer match"),
+                let binop: fn(&Value, &Value) -> Result<Value, String> = match op {
                     FOp::Add => Value::add,
                     FOp::Mul => Value::mul,
-                    FOp::Or => Value::or,
-                    FOp::And => Value::and,
+                    FOp::Or => |a, b| Ok(Value::Bool(a.truthy() || b.truthy())),
+                    FOp::And => |a, b| Ok(Value::Bool(a.truthy() && b.truthy())),
+                    _ => unreachable!("outer match"),
                 };
                 for f in it {
                     let ctx = ctx.clone();
@@ -696,9 +851,82 @@ impl F {
                 hd
             }
 
+            // cheeky chained comparisons
+            // x < y < z == 4 -> x < y && y < z && z == 4
+            F::Binop(op @ (FOp::Lt | FOp::Gt | FOp::Eq), fs) => {
+                let mut it = fs.iter().cloned();
+                let binop: fn(&Value, &Value) -> Result<bool, String> = match op {
+                    FOp::Gt => |a, b| Ok(a > b),
+                    FOp::Lt => |a, b| Ok(a < b),
+                    FOp::Eq => |a, b| Ok(a == b),
+                    _ => unreachable!("outer match"),
+                };
+
+                // at least 2 values asserted by match guard
+                let f0 = it.next().expect("len == 0,1 handled already");
+                let f1 = it.next().expect("len == 0,1 handled already");
+                let ctx0 = ctx.clone();
+                let mut hd = f0.eval(ctx.clone()).flatter_map(move |(_, a)| {
+                    let env0 = ctx0.0.clone();
+                    f1.eval(ctx0.clone())
+                        .flatter_map(move |(_, b)| match binop(&a, &b) {
+                            Ok(acc) => FIt::One((env0.clone(), acc, b)),
+                            Err(err) => errexit!("{err}"),
+                        })
+                });
+                for f in it {
+                    let ctx = ctx.clone();
+                    hd = hd.flatter_map(move |(_, acc, v)| {
+                        let env0 = ctx.0.clone();
+                        f.eval(ctx.clone())
+                            .flatter_map(move |(_, w)| match binop(&v, &w) {
+                                Ok(v) => FIt::One((env0.clone(), acc && v, w)),
+                                Err(err) => errexit!("{err}"),
+                            })
+                    })
+                }
+                hd.flatter_map(|(e, v, _)| FIt::One((e, Value::Bool(v))))
+            }
+
             // function defined in wider scope
-            F::Call(_name, _args) => {
-                todo!()
+            F::Call(name, args) => {
+                let (a, f) = match ctx.0.fget(name) {
+                    Some((args, f)) => (args, f.clone()),
+                    None => match ctx.0.get(name) {
+                        Some(v) => (&[][..], F::Literal(v)),
+                        None => errexit!("error: filter {name} is not defined"),
+                    },
+                };
+
+                if args.len() != a.len() {
+                    errexit!(
+                        "error: {name} takes {} arguments, given {}",
+                        a.len(),
+                        args.len()
+                    );
+                }
+                let mut env = ctx.0.clone();
+                let mut ait = FIt::One(ctx.0.clone());
+                for i in 0..a.len() {
+                    let a = a[i].clone();
+                    let arg = args[i].clone();
+                    let ctx = ctx.clone();
+                    ait = ait.flatter_map(move |e: Env| {
+                        let name = a.clone();
+                        arg.eval(ctx.clone()).flatter_map(move |(_, v)| {
+                            let mut e = e.clone();
+                            e.set(&name, v);
+                            FIt::One(e)
+                        })
+                    });
+                }
+                // eval body of function with all arguments bound
+                // but the env should be pipeline's env, not function body env
+                ait.flatter_map(move |e| {
+                    let env = env.clone();
+                    f.eval((e, ctx.1.clone()))
+                        .flatter_map(move |(_, v)| FIt::One((env.clone(), v)))
+                })
             }
         }
     }
@@ -765,7 +993,7 @@ impl Display for F {
                     write!(f, "({g}) as ${name}")
                 }
             }
-            F::Get(name) => write!(f, "${name}"),
+            F::Get(name) => write!(f, "{name}"),
             F::Binop(_, fs) if fs.is_empty() => Ok(()),
             F::Binop(op, fs) => {
                 fn factor(g: &F, p: usize, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -788,7 +1016,7 @@ impl Display for F {
             }
             F::Call(name, args) => {
                 write!(f, "{name}({}", args[0])?;
-                for arg in args {
+                for arg in &args[1..] {
                     write!(f, ", {arg}")?;
                 }
                 write!(f, ")")
@@ -835,11 +1063,70 @@ impl<Vs: Iterator + 'static> FIt<Vs> {
     }
 }
 
+type FDef = (String, Vec<String>, F);
+enum Stmt {
+    Expr(F),
+    Def(FDef),
+}
+
+impl Stmt {
+    fn eval(&self, env: Vec<FDef>, val: Value) -> (Vec<FDef>, Value, FIter) {
+        match self {
+            Stmt::Expr(f) => {
+                let it = f.eval((Env::Root(Rc::new(env.clone())), val.clone()));
+                (env, val, it)
+            }
+            Stmt::Def((name, args, f)) => {
+                let mut env = env;
+                env.push((name.clone(), args.clone(), f.clone()));
+                (env, val, FIt::Zero)
+            }
+        }
+    }
+
+    fn normalize(&mut self) {
+        match self {
+            Stmt::Expr(f) => f.normalize(),
+            Stmt::Def((_, _, f)) => f.normalize(),
+        }
+    }
+}
+
+impl Display for Stmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stmt::Expr(g) => g.fmt(f),
+            Stmt::Def((name, args, g)) if args.is_empty() => write!(f, "def {name}: {g}"),
+            Stmt::Def((name, args, g)) => {
+                write!(f, "def {name}({}", args[0])?;
+                for a in &args[1..] {
+                    write!(f, ", {a}")?;
+                }
+                write!(f, "): {g}")
+            }
+        }
+    }
+}
+
 impl std::ops::BitOr<F> for Value {
     type Output = FIter;
 
     fn bitor(self, rhs: F) -> Self::Output {
         rhs.eval((Env::new(), self))
+    }
+}
+
+impl std::ops::BitOr<Vec<Stmt>> for Value {
+    type Output = FIter;
+
+    fn bitor(self, rhs: Vec<Stmt>) -> Self::Output {
+        let (mut env, mut val, mut it) = (vec![], self, FIt::Zero);
+        for s in rhs {
+            let it1;
+            (env, val, it1) = s.eval(env, val);
+            it = FIter::Many(Box::new(it.chain(it1)));
+        }
+        it
     }
 }
 
@@ -1066,10 +1353,12 @@ fn show_parse_error(
 
 fn main() {
     let arg1 = std::env::args().skip(1).next().unwrap_or(String::new());
-    let f = match grammar::FilterParser::new().parse(&arg1) {
-        Ok(mut f) => {
-            f.normalize();
-            f
+    let stmts = match grammar::StatementsParser::new().parse(&arg1) {
+        Ok(mut ss) => {
+            for s in ss.iter_mut() {
+                s.normalize();
+            }
+            ss
         }
         Err(err) => {
             show_parse_error("<arg[1]>", &arg1, &err);
@@ -1077,7 +1366,11 @@ fn main() {
         }
     };
 
-    println!("filter: {f}");
+    print!("filter: ");
+    for s in &stmts {
+        print!("{s}; ");
+    }
+    println!();
 
     let mut input = String::new();
     std::io::stdin()
@@ -1090,7 +1383,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    for (_, v) in val | f {
+    for (e, v) in val | stmts {
         println!("{v}");
     }
 }

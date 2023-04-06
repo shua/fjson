@@ -1,4 +1,4 @@
-use crate::{Value as V, F, FPath, FOp};
+use crate::{Value as V, F, FPath, FOp, Stmt};
 use std::str::FromStr;
 
 grammar;
@@ -31,12 +31,18 @@ KVPair<V>: (String, V) = {
 
 pub(crate) Value: V = {
 	VPrimitive,
-	"[" <Comma<Value>> "]" => V::Array(<>),
-	"{" <Comma<KVPair<Value>>> "}" => V::Object(<>),
+	"[" <Sep0<",", Value>> "]" => V::Array(<>),
+	"{" <Sep0<",", KVPair<Value>>> "}" => V::Object(<>),
 }
 
-FIdent: String = {
-	r"[a-zA-Z_][0-0a-zA-Z_]*" => <>.to_string(),
+FId: &'input str = {
+	r"[a-zA-Z_][0-0a-zA-Z_]*" => <>,
+}
+FIdVar: String = {
+	"$" <FId> => format!("${}", <>),
+}
+FIdCall: String = {
+	FId => <>.to_string(),
 }
 
 FPathIndex: (FPath, bool) = {
@@ -48,7 +54,7 @@ FPathIndex: (FPath, bool) = {
 }
 FPath: Vec<(FPath, bool)> = {
 	"." <FPathIndex+> => <>,
-	"." <fld:FIdent> <s:"?"?> => vec![(FPath::Field(fld), s.is_some())],
+	"." <fld:FIdCall> <s:"?"?> => vec![(FPath::Field(fld), s.is_some())],
 }
 
 Sep1<S, T>: Vec<T> = {
@@ -61,36 +67,57 @@ Sep0<S, T> : Vec<T> = {
 	=> vec![],
 	Sep1<S, T>,
 }
-Comma<T> : Vec<T> = Sep0<",", T>;
 
 pub(crate) Filter: F = {
 	Sep1<"|", Filter2> => F::Binop(FOp::Pipe, <>),
 }
 
 Filter2: F = {
-	<f:Filter3> <name:("as" "$" <FIdent>)?> => match name {
+	<f:Filter3> <name:("as" <FIdVar>)?> => match name {
 		Some(name) => F::Set(name, Box::new(f)),
 		None => f,
 	}
 }
 Filter3: F = {
-	Sep1<"+", Filter4> => F::Binop(FOp::Add, <>),
+	Sep1<" or ", Filter4> => F::Binop(FOp::Or, <>),
 }
 Filter4: F = {
-	Sep1<"*", Filter5> => F::Binop(FOp::Mul, <>),
+	Sep1<" and ", Filter5> => F::Binop(FOp::And, <>),
+}
+Ord: std::cmp::Ordering = {
+	"<" => std::cmp::Ordering::Less,
+	">" => std::cmp::Ordering::Greater,
+	"==" => std::cmp::Ordering::Equal,
 }
 Filter5: F = {
-	Sep1<" or ", Filter6> => F::Binop(FOp::Or, <>),
+	<mut vs:(Filter10 Ord)*> <tl:Filter10> => {
+		F::from_cmp_chain(vs, tl)
+	},
 }
-Filter6: F = {
-	Sep1<" and ", FilterN> => F::Binop(FOp::And, <>),
+Filter10: F = {
+	Sep1<"+", Filter11> => F::Binop(FOp::Add, <>),
+}
+Filter11: F = {
+	Sep1<"*", FilterN> => F::Binop(FOp::Mul, <>),
 }
 FilterN: F = {
 	VPrimitive => F::Literal(<>),
 	FPath+ => F::Path(<>.into_iter().flat_map(|p| p.into_iter()).collect()),
 	"." => F::Path(vec![]),
 	"(" <Filter> ")",
-	"$" <FIdent> => F::Get(<>),
-	"[" <Comma<Filter>> "]" => F::Array(<>),
-	"{" <Comma<KVPair<Filter>>> "}" => F::Object(<>),
+	<FIdVar> => F::Get(<>),
+	"[" <Sep0<",", Filter>> "]" => F::Array(<>),
+	"{" <Sep0<",", KVPair<Filter>>> "}" => F::Object(<>),
+	<name:FIdCall> <args:("(" <Sep0<",", Filter>> ")")?> => F::Call(name, args.unwrap_or_default()),
 };
+
+Statement: Stmt = {
+	"def " <name:FIdCall> <args:("(" <Sep0<",", FIdCall>> ")")?> ":" <f:Filter> => {
+		Stmt::Def((name.to_string(), args.unwrap_or(vec![]), f))
+	},
+	<Filter> => Stmt::Expr(<>),
+}
+
+pub(crate) Statements: Vec<Stmt> = {
+	Sep1<";", Statement>,
+}
